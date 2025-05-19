@@ -12,7 +12,22 @@ from operator import itemgetter
 from pathlib import Path
 from time import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
-
+import io
+from siflowai import sibuffer,sifile
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    Generator,
+    IO,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)    
 import psutil
 import torch
 from torch import multiprocessing as mp
@@ -28,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
 
+pinned_memory_cache: Dict[Tuple[str, str, str], torch.Tensor] = {}
+
 _results_queue = None
 
 
@@ -38,7 +55,12 @@ def _get_write_results_queue():
         with _disable_gc():
             _results_queue = ctx.Manager().Queue()
     return _results_queue
+class _StorageInfo:
+    """This is the per entry storage info."""
 
+    relative_path: str
+    offset: int
+    length: int
 
 class FileSystemWriterAsync(FileSystemWriter):
     """
@@ -190,6 +212,8 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
+            # for item, tensor in tensor_data:
+            #     print(f"[{os.getpid()}]: preload_tensors for {file_name}, {storage_key=}, {type(item)=}, {item=} {tensor.dtype=}, {tensor.shape=}")
             tensor_data = [
                 (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
             ]
@@ -316,11 +340,13 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
             with open(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
+                    # print(f"[{os.getpid()}]: write_preload_data for {file_name}, {storage_key=}, {type(write_item)=}, {write_item=} {type(data)}")
                     local_results.append(
                         _write_item(*transform_list, stream, data, write_item, storage_key)
                     )
 
                 for write_item, tensor in tensor_data:
+                    # print(f"[{os.getpid()}]: write_preload_data for {file_name}, {storage_key=}, {type(write_item)=}, {write_item=} {tensor.dtype=}, {tensor.shape=}")
                     assert tensor.is_cpu
                     local_results.append(
                         _write_item(*transform_list, stream, tensor, write_item, storage_key)
@@ -368,6 +394,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 raise RuntimeError(f'results_queue should not be empty')
 
         if isinstance(write_results_or_exc, Exception):
+            print(write_results_or_exc)
             raise RuntimeError(f'Worker failure: {write_results_or_exc}') from write_results_or_exc
         write_results: dict = write_results_or_exc
         if len(write_results) != len(self.write_buckets):
@@ -391,7 +418,203 @@ class FileSystemWriterAsync(FileSystemWriter):
         return dataclasses.replace(
             local_plan, storage_data=_StoragePrefix(f"__{torch.distributed.get_rank()}_")
         )
+class UbiFileSystemWriterAsync(FileSystemWriterAsync):
+    @staticmethod
+    def preload_tensors(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+        # result = []
+        # global pinned_memory_cache
+        # for bucket in write_buckets:
+        #     file_name, storage_key, (bytes_data, tensor_data) = bucket
+        #     preloaded_tensor_data = []
+        #     for item,tensor in tensor_data:
+        #         key =(item.index.fqn,tuple(item.index.offset),tuple(item.tensor_data.size))
+        #         if key not in pinned_memory_cache:
+        #             pinned_buf = sibuffer(tensor,tensor.shape) ##未来需要替换的地方
+        #             pinned_memory_cache[key] = pinned_buf
+        #         else:
+        #             pinned_buf = pinned_memory_cache[key]
+        #         pinned_buf.copy_(tensor,non_blocking=non_blocking)
+        #         preloaded_tensor_data.append((item, pinned_buf))
+        #     result.append((file_name, storage_key, (bytes_data, preloaded_tensor_data)))
+        # if non_blocking:
+        #     torch.cuda.synchronize()
+        # return result
+    
+        result = []
+        
+        for bucket in write_buckets:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            new_tensor_data = []
+            for item,tensor in tensor_data:
+                siflow_buffer = sibuffer(tensor.dtype,tensor.shape)
+                cpu_tensor = torch.frombuffer(siflow_buffer,dtype=tensor.dtype).reshape(tensor.shape)
+                cpu_tensor.copy_(tensor)
+                new_tensor_data.append((item,cpu_tensor))
+            tensor_data = new_tensor_data
+                
 
+            # tensor_data = [
+            #     (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
+            # ]
+            result.append((file_name, storage_key, (bytes_data, tensor_data)))
+        if non_blocking:
+            torch.cuda.synchronize()
+        return result
+    @staticmethod
+    @_disable_gc()
+    def write_preloaded_data_multiproc(
+        transform_list, rank, write_buckets: List[WriteBucket], global_results_queue: mp.Queue
+    ) -> None:
+        logger = logging.getLogger(__name__)
+        w_start = time()
+        write_results_or_exc: Union[dict, Exception] = dict()
+        ctx = mp.get_context('fork')
+        local_results_queue = ctx.Queue()
+        count_queue = ctx.JoinableQueue()
+        p_list = []
+        for i, write_bucket in enumerate(write_buckets):
+            try:
+                count_queue.put(i)
+                p_list.append(
+                    ctx.Process(
+                        target=partial(UbiFileSystemWriterAsync.write_preloaded_data, transform_list),
+                        args=(i, write_bucket, local_results_queue, count_queue, True),
+                    )
+                )
+            except Exception as e:
+                err_msg = f'An error is caught while a proc {i} is created, error: {e}'
+                logger.error(err_msg)
+                write_results_or_exc = RuntimeError(err_msg)
+
+        if not isinstance(write_results_or_exc, Exception):
+            for p in p_list:
+                p.start()
+
+            logger.debug('FileSystemWriterAsync: collecting worker results...')
+
+            # To make sure all nodes are completed
+            count_queue.join()
+            # At this point, all workers completed, so the queue should have exactly
+            # `len(write_buckets)` items
+            for proc_idx in range(len(write_buckets)):
+                try:
+                    local_proc_idx, local_results_or_exc = local_results_queue.get()
+                except queue.Empty:
+                    write_results_or_exc = RuntimeError(
+                        f'Unexpected empty `local_results_queue`'
+                        f' (got only {proc_idx}/{len(write_buckets)} items)'
+                    )
+                    break
+                else:
+                    if isinstance(local_results_or_exc, Exception):
+                        err_msg = (
+                            f"Local process {local_proc_idx} encountered"
+                            f" an error: {local_results_or_exc}"
+                        )
+                        logger.error(err_msg)
+                        write_results_or_exc = local_results_or_exc
+                        break
+                    assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
+                    write_results_or_exc[local_proc_idx] = local_results_or_exc
+                    p_list[local_proc_idx].join()
+
+            logger.debug('FileSystemWriterAsync: collected worker results successfully')
+
+        global_results_queue.put(write_results_or_exc)
+
+        w_end = time()
+        logger.debug(f"{w_end}, rank: {rank}," f" write(sync,parallel): {w_end - w_start}")
+
+    @staticmethod
+    @_disable_gc()
+    def write_preloaded_data(
+        transform_list,
+        local_proc_idx: int,
+        write_bucket: WriteBucket,
+        results_queue: mp.SimpleQueue,
+        count_queue: mp.JoinableQueue,
+        use_fsync: bool,
+    ) -> None:
+        logger = logging.getLogger(__name__)
+        logger.debug(f'{local_proc_idx} started')
+        mem_before = _process_memory()
+
+        local_results = []
+        try:
+            file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+
+            stream = sifile(str(file_name))  ##这里替换open 
+
+            try:
+                for write_item,data in bytes_data:
+                    local_results.append(
+                        UbiFileSystemWriterAsync.ubi_write_item(*transform_list, stream, data, write_item, storage_key)  ##这里不动，去里面替换write 
+                    )
+                for write_item,tensor in tensor_data:
+                    local_results.append(
+                        UbiFileSystemWriterAsync.ubi_write_item(*transform_list, stream, tensor, write_item, storage_key)
+                    )
+                if use_fsync:
+                    os.fsync(stream.fileno())
+            finally:
+                stream.close()  #这里替换close
+
+
+            # with open(file_name, "wb") as stream: 
+            #     for write_item, data in bytes_data:
+            #         # print(f"[{os.getpid()}]: write_preload_data for {file_name}, {storage_key=}, {type(write_item)=}, {write_item=} {type(data)}")
+            #         local_results.append(
+            #             _write_item(*transform_list, stream, data, write_item, storage_key)  
+            #         )
+
+            #     for write_item, tensor in tensor_data:
+            #         # print(f"[{os.getpid()}]: write_preload_data for {file_name}, {storage_key=}, {type(write_item)=}, {write_item=} {tensor.dtype=}, {tensor.shape=}")
+            #         assert tensor.is_cpu
+            #         local_results.append(
+            #             _write_item(*transform_list, stream, tensor, write_item, storage_key)
+            #         )
+
+            #     if use_fsync:
+            #         os.fsync(stream.fileno())
+            local_output = (local_proc_idx, local_results)
+        except Exception as e:
+            logger.debug(f'{local_proc_idx} failed')
+            local_output = (local_proc_idx, e)
+
+        results_queue.put(local_output)
+        # Signal this process is done.
+        count_queue.get()
+        count_queue.task_done()
+
+        mem_after = _process_memory()
+        logger.debug(
+            f"{local_proc_idx} consumed: {mem_after - mem_before},"
+            f" before: {mem_before}, after: {mem_after}"
+        )
+
+    def ubi_write_item(
+        stream: io.IOBase,
+        data: Union[io.BytesIO, torch.Tensor],
+        write_item: WriteItem,
+        storage_key: str,
+    ) -> WriteResult:
+        offset = stream.tell()
+
+        if write_item.type == WriteItemType.BYTE_IO:
+            assert isinstance(data, io.BytesIO)
+            stream.write(data.getbuffer())  ##这里改成write
+        else:
+            assert isinstance(data, torch.Tensor)
+            assert data.device == torch.device("cpu")
+            stream.write(data)
+        length = stream.tell() - offset
+
+        return WriteResult(
+            index=write_item.index,
+            size_in_bytes=length,
+            storage_data=_StorageInfo(storage_key, offset, length),
+        )
+    
 
 def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
     """
@@ -501,3 +724,4 @@ def _process_memory() -> int:
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     return mem_info.rss
+

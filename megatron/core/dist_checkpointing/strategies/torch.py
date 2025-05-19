@@ -37,7 +37,7 @@ from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
-
+from megatron.training.global_vars import get_args
 from ...utils import get_torch_version, is_torch_min_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
@@ -56,8 +56,8 @@ from .base import (
     StrategyAction,
     register_default_strategy,
 )
-from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
-from .filesystem_async import FileSystemWriterAsync
+from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader,UbiCachedMetadataFileSystemReader
+from .filesystem_async import FileSystemWriterAsync,UbiFileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
     apply_nd_flattened_tensors_reformulation,
@@ -704,6 +704,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns: None
         """
         # Translate the state dict
+        args = get_args()
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(
                 sharded_state_dict, self.keep_only_main_replica
@@ -711,9 +712,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
-        writer = FileSystemWriterAsync(
-            checkpoint_dir, separation_hint=self.separation_hint, thread_count=self.thread_count
-        )
+        if True:
+            writer = UbiFileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        else:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir, separation_hint=self.separation_hint, thread_count=self.thread_count
+            )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
         # Try twice to validate the generated `central_plan` is the same across iterations
@@ -856,6 +860,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         Returns: loaded state dict
         """
         # Apply N-D tensors resharding
+        args = get_args()
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(
             sharded_state_dict, reformulation_metadata
@@ -888,7 +893,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
-        fsr = CachedMetadataFileSystemReader(checkpoint_dir)
+        if args.ubi_loader:
+            fsr = UbiCachedMetadataFileSystemReader(checkpoint_dir)
+        else:
+            fsr = CachedMetadataFileSystemReader(checkpoint_dir)
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
@@ -1054,3 +1062,4 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
+
