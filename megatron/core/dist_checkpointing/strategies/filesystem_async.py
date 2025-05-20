@@ -36,7 +36,7 @@ from torch.distributed.checkpoint.filesystem import DEFAULT_SUFFIX, _StoragePref
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteItem, WriteItemType
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
-
+from dataclasses import dataclass
 from .async_utils import _disable_gc
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ def _get_write_results_queue():
         with _disable_gc():
             _results_queue = ctx.Manager().Queue()
     return _results_queue
+@dataclass
 class _StorageInfo:
     """This is the per entry storage info."""
 
@@ -554,8 +555,8 @@ class UbiFileSystemWriterAsync(FileSystemWriterAsync):
                     local_results.append(
                         UbiFileSystemWriterAsync.ubi_write_item(*transform_list, stream, tensor, write_item, storage_key)
                     )
-                if use_fsync:
-                    os.fsync(stream.fileno())
+                # if use_fsync:
+                #     os.fsync(stream.fileno())
             finally:
                 stream.close()  #这里替换close
 
@@ -602,7 +603,7 @@ class UbiFileSystemWriterAsync(FileSystemWriterAsync):
 
         if write_item.type == WriteItemType.BYTE_IO:
             assert isinstance(data, io.BytesIO)
-            stream.write(data.getbuffer())  ##这里改成write
+            stream.write(data.getvalue())  ##这里改成write
         else:
             assert isinstance(data, torch.Tensor)
             assert data.device == torch.device("cpu")

@@ -1873,7 +1873,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
-
+    group.add_argument('--ubi_loader',action='store_true',
+                       help='Using ubi_loader for data loading')
     return parser
 
 

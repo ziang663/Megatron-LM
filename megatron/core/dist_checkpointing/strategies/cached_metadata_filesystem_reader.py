@@ -1,5 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-
+from siflowai import sifile 
 """ FS Reader with metadata cached support. """
 import collections
 import torch
@@ -75,8 +75,8 @@ class CachedMetadataFileSystemReader(FileSystemReader):
         return self._cached_metadata
 class UbiCachedMetadataFileSystemReader(CachedMetadataFileSystemReader):
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        # group requests by file
-        per_file: Dict[str, List[ReadItem]] = {}
+
+        per_file: Dict[str, List] = {}
         for read_item in plan.items:
             item_md = self.storage_data[read_item.storage_index]
             path = item_md.relative_path
@@ -84,36 +84,39 @@ class UbiCachedMetadataFileSystemReader(CachedMetadataFileSystemReader):
 
         for relative_path, reqs in per_file.items():
             new_path = self.fs.concat_path(self.path, relative_path)
-            with self.fs.create_stream(new_path, "rb") as stream:#替换的地方
-                # TODO sort by offset and cache the reading
+            si = sifile(str(new_path))  
+            try:
                 for req in reqs:
                     item_md = self.storage_data[req.storage_index]
-                    file_slice = self._slice_file(stream, item_md)
+                    offset = item_md.offset
+                    length = item_md.length
+
                     if req.type == LoadItemType.BYTE_IO:
-                        read_bytes = io.BytesIO(file_slice.read(item_md.length))
-                        read_bytes.seek(0)
-                        planner.load_bytes(req, read_bytes) ##替换的地方
+                        read_bytes = si.read(offset, length)
+                        byte_stream = io.BytesIO(read_bytes)
+                        byte_stream.seek(0)
+                        planner.load_bytes(req, byte_stream)
                     else:
-                        tensor = cast(
-                            Tensor,
-                            torch.load(
-                                cast(IO[bytes], file_slice),
-                                map_location="cpu",
-                                weights_only=True,
-                            ),
-                        )
-                        tensor = narrow_tensor_by_index(
-                            tensor, req.storage_offsets, req.lengths
-                        )
+                        read_bytes = si.read(offset, length)
+                        # 使用 numpy 进行反序列化，再转成 torch tensor
+                        dtype = req.properties.dtype
+                        shape = tuple(req.lengths)
+                        np_dtype = np.dtype(str(dtype).replace('torch.', ''))
+                        np_arr = np.frombuffer(read_bytes, dtype=np_dtype).reshape(shape)
+                        tensor = torch.from_numpy(np_arr)
+
+                        # 处理偏移 (optional，根据是否分片)
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()
 
-                        assert (
-                            target_tensor.size() == tensor.size()
-                        ), f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                        assert target_tensor.size() == tensor.size(), (
+                            f"Tensor size mismatch at index {req.storage_index}: {target_tensor.size()} vs {tensor.size()}"
+                        )
                         target_tensor.copy_(tensor)
                         planner.commit_tensor(req, target_tensor)
-                    #替换的地方
+            finally:
+                si.close()
 
-        fut: Future = Future()
+        fut = Future()
         fut.set_result(None)
-        return fut    
+        return fut

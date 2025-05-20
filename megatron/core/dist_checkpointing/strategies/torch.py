@@ -893,7 +893,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
-        if args.ubi_loader:
+        if True:
             fsr = UbiCachedMetadataFileSystemReader(checkpoint_dir)
         else:
             fsr = CachedMetadataFileSystemReader(checkpoint_dir)
