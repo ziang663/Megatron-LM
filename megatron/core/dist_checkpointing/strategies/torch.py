@@ -712,7 +712,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
-        if True:
+        if args.use_ubi:
             writer = UbiFileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
         else:
             writer = FileSystemWriterAsync(
@@ -893,7 +893,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
-        if True:
+        if args.use_ubi:
             fsr = UbiCachedMetadataFileSystemReader(checkpoint_dir)
         else:
             fsr = CachedMetadataFileSystemReader(checkpoint_dir)

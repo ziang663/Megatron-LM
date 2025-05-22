@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 from siflowai import sifile 
+import numpy as np
 """ FS Reader with metadata cached support. """
 import collections
 import torch

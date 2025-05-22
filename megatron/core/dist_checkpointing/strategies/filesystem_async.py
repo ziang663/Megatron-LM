@@ -215,6 +215,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             # for item, tensor in tensor_data:
             #     print(f"[{os.getpid()}]: preload_tensors for {file_name}, {storage_key=}, {type(item)=}, {item=} {tensor.dtype=}, {tensor.shape=}")
+
+
             tensor_data = [
                 (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
             ]
@@ -422,41 +424,24 @@ class FileSystemWriterAsync(FileSystemWriter):
 class UbiFileSystemWriterAsync(FileSystemWriterAsync):
     @staticmethod
     def preload_tensors(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
-        # result = []
-        # global pinned_memory_cache
-        # for bucket in write_buckets:
-        #     file_name, storage_key, (bytes_data, tensor_data) = bucket
-        #     preloaded_tensor_data = []
-        #     for item,tensor in tensor_data:
-        #         key =(item.index.fqn,tuple(item.index.offset),tuple(item.tensor_data.size))
-        #         if key not in pinned_memory_cache:
-        #             pinned_buf = sibuffer(tensor,tensor.shape) ##未来需要替换的地方
-        #             pinned_memory_cache[key] = pinned_buf
-        #         else:
-        #             pinned_buf = pinned_memory_cache[key]
-        #         pinned_buf.copy_(tensor,non_blocking=non_blocking)
-        #         preloaded_tensor_data.append((item, pinned_buf))
-        #     result.append((file_name, storage_key, (bytes_data, preloaded_tensor_data)))
-        # if non_blocking:
-        #     torch.cuda.synchronize()
-        # return result
     
         result = []
         
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            new_tensor_data = []
-            for item,tensor in tensor_data:
-                siflow_buffer = sibuffer(tensor.dtype,tensor.shape)
-                cpu_tensor = torch.frombuffer(siflow_buffer,dtype=tensor.dtype).reshape(tensor.shape)
-                cpu_tensor.copy_(tensor)
-                new_tensor_data.append((item,cpu_tensor))
-            tensor_data = new_tensor_data
+            # new_tensor_data = []
+            # for item,tensor in tensor_data:
+            #     siflow_buffer = sibuffer(tensor.dtype,tensor.shape)
+            #     cpu_tensor = torch.frombuffer(siflow_buffer,dtype=tensor.dtype).reshape(tensor.shape)
+            #     tensor_cpu = tensor.to("cpu", non_blocking=non_blocking)
+            #     cpu_tensor.copy_(tensor_cpu)
+            #     new_tensor_data.append((item,cpu_tensor))
+            # tensor_data = new_tensor_data
                 
 
-            # tensor_data = [
-            #     (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
-            # ]
+            tensor_data = [
+                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
+            ]
             result.append((file_name, storage_key, (bytes_data, tensor_data)))
         if non_blocking:
             torch.cuda.synchronize()
