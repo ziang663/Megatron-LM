@@ -787,6 +787,96 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
 
+    def siflow_async_save(
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+    ) -> AsyncRequest:
+        """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
+
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict to save
+            checkpoint_dir (Path): checkpoint directory
+
+        Returns: None
+        """
+        # Translate the state dict
+        args = get_args()
+        (sharded_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(
+                sharded_state_dict, self.keep_only_main_replica
+            )
+        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        # Use PyT saving mechanism
+        writer = UbiFileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        # This should be set differently if we run in a smaller process group than the default
+        coordinator = 0
+        # Try twice to validate the generated `central_plan` is the same across iterations
+        # If so, reuse `cached_central_plan` and `cached_global_metadata`
+        # From the 3rd iteration, `save_state_dict_async_plan` will not generate `global_metadata`
+        # (return None) so `self.cached_global_metadata` is reused
+        args_cached_plans = None
+        loaded_all_plans = None
+        if self.use_cached_ckpt_structure:
+            loaded_all_plans = getattr(self.cached_global_metadata, "all_local_plans", None)
+            if loaded_all_plans is None:
+                logger.debug(
+                    "no all_local_plans in metadata - can't verify global metadata reuse..."
+                )
+
+            args_cached_plans = (
+                self.cached_central_plan,
+                self.cached_local_plan,
+                self.validated_cache_reuse,
+            )
+
+        (
+            save_state_dict_ret,
+            self.cached_central_plan,
+            self.cached_local_plan,
+            self.validated_cache_reuse,
+            self.validated_loaded_metadata_reuse,
+        ) = save_state_dict_async_plan(
+            pyt_state_dict,
+            writer,
+            None,
+            coordinator,
+            planner=MCoreSavePlanner(
+                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
+            ),
+            cached_ckpt_structure=args_cached_plans,
+            loaded_all_plans=loaded_all_plans,
+        )
+        rank = torch.distributed.get_rank()
+        if self.use_cached_ckpt_structure:
+            if (
+                loaded_all_plans
+                and self.cached_global_metadata
+                and self.validated_loaded_metadata_reuse
+            ):
+                if coordinator == rank:
+                    logger.debug(
+                        f"rank: {rank}, reuse global metadata from loaded"
+                        f" .metadata, {save_state_dict_ret[1]}"
+                    )
+                    save_state_dict_ret = list(save_state_dict_ret)
+                    save_state_dict_ret[1] = self.cached_global_metadata
+
+            elif self.validated_cache_reuse:
+                logger.debug(f"rank: {rank}, cache validated")
+                if save_state_dict_ret[1]:  # when global_metadata is not cached
+                    self.cached_global_metadata = save_state_dict_ret[1]  # Cache Metadata
+                # Only Coordinator rank holds cached global_metadata
+                # (None is returned for global_metadata)
+                elif coordinator == rank:
+                    logger.debug(
+                        f"rank: {rank}, reuse global metadata cached from previous"
+                        f" save iteration, {save_state_dict_ret[1]}"
+                    )
+                    save_state_dict_ret = list(save_state_dict_ret)
+                    save_state_dict_ret[1] = self.cached_global_metadata
+
+        return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+    
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
